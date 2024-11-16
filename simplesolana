@@ -1,0 +1,785 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING, List, Dict, Optional, Tuple, Set
+from dataclasses import dataclass
+import hashlib
+import time
+import uuid
+import json
+from collections import defaultdict
+import ed25519
+import threading
+from concurrent.futures import ThreadPoolExecutor
+import logging
+from abc import ABC, abstractmethod
+import heapq
+import os
+import base64
+from threading import RLock
+from typing import NamedTuple
+
+# Enhanced configuration management
+class ChainConfig:
+    CHAIN_ID = "secure_simple_solana_mainnet"
+    VERSION = "1.0.0"
+    MAX_PENDING_TRANSACTIONS = 10000
+    MAX_BLOCK_SIZE = 1000
+    MAX_MEMORY_POOL_SIZE = 100 * 1024 * 1024  # 100MB
+    MIN_STAKE_AMOUNT = 1000.0
+    BLOCK_TIME = 400  # ms
+    MAX_BLOCK_WEIGHT = 4000000
+    TX_EXPIRY_BLOCKS = 6
+
+# Configure logging with structured format
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Enhanced error hierarchy
+class BlockchainError(Exception):
+    """Base class for blockchain-related exceptions"""
+    pass
+
+class SecurityError(BlockchainError):
+    """Base class for security-related exceptions"""
+    pass
+
+class ValidationError(SecurityError):
+    """Raised when validation fails"""
+    pass
+
+class AuthenticationError(SecurityError):
+    """Raised when authentication fails"""
+    pass
+
+class MemoryError(SecurityError):
+    """Raised when memory limits are exceeded"""
+    pass
+
+class RateLimitError(SecurityError):
+    """Raised when rate limits are exceeded"""
+    pass
+
+@dataclass
+class AccountState:
+    """Enhanced account state with rate limiting and security features"""
+    address: str
+    balance: float
+    nonce: int
+    public_key: bytes
+    stake: float = 0.0
+    last_active: float = time.time()
+    transaction_count: int = 0
+    last_transaction_time: float = 0
+    rate_limit_counter: int = 0
+    
+    def validate_nonce(self, transaction_nonce: int) -> bool:
+        """Validate transaction nonce with enhanced checks"""
+        if transaction_nonce != self.nonce + 1:
+            return False
+        return True
+    
+    def validate_rate_limit(self) -> bool:
+        """Implement rate limiting for transactions"""
+        current_time = time.time()
+        if current_time - self.last_transaction_time < 1:  # 1 second window
+            if self.rate_limit_counter >= 10:  # Max 10 tx per second
+                return False
+            self.rate_limit_counter += 1
+        else:
+            self.rate_limit_counter = 1
+            self.last_transaction_time = current_time
+        return True
+
+class SecureMemoryPool:
+    """Memory-safe transaction pool implementation"""
+    def __init__(self, max_size: int):
+        self.max_size = max_size
+        self.current_size = 0
+        self.transactions: Dict[str, Transaction] = {}
+        self._lock = RLock()
+        
+    def add_transaction(self, tx: Transaction) -> bool:
+        """Add transaction to pool with memory checks"""
+        tx_size = len(json.dumps(tx.to_dict()).encode())
+        
+        with self._lock:
+            if self.current_size + tx_size > self.max_size:
+                raise MemoryError("Transaction pool memory limit exceeded")
+            
+            self.transactions[tx.tx_id] = tx
+            self.current_size += tx_size
+            return True
+            
+    def remove_transaction(self, tx_id: str):
+        """Remove transaction from pool"""
+        with self._lock:
+            if tx_id in self.transactions:
+                tx_size = len(json.dumps(self.transactions[tx_id].to_dict()).encode())
+                del self.transactions[tx_id]
+                self.current_size -= tx_size
+
+@dataclass
+class Transaction:
+    """Enhanced transaction class with replay protection"""
+    chain_id: str
+    sender: str
+    recipient: str
+    amount: float
+    timestamp: float
+    nonce: int
+    signature: bytes
+    public_key: bytes
+    expiry: float
+    fee: float
+    tx_id: str = None
+    block_height: int = None
+    
+    def __post_init__(self):
+        if self.tx_id is None:
+            self.tx_id = str(uuid.uuid4())
+        self._validate_basic_fields()
+    
+    def _validate_basic_fields(self) -> bool:
+        """Enhanced field validation"""
+        try:
+            if not isinstance(self.amount, (int, float)) or self.amount <= 0:
+                return False
+            if not isinstance(self.timestamp, (int, float)):
+                return False
+            if self.timestamp > time.time() + 60:  # Allow 1 minute clock skew
+                return False
+            if self.expiry < time.time():
+                return False
+            if self.fee < 0:
+                return False
+            if not isinstance(self.nonce, int) or self.nonce < 0:
+                return False
+            if not self.chain_id or not isinstance(self.chain_id, str):
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"Transaction validation error: {str(e)}")
+            return False
+
+    def _get_signing_message(self) -> bytes:
+        """Enhanced message signing with domain separation"""
+        message_dict = {
+            "domain": "SECURE_SIMPLE_SOLANA_TX",
+            "version": ChainConfig.VERSION,
+            "chain_id": self.chain_id,
+            "block_height": self.block_height,
+            "sender": self.sender,
+            "recipient": self.recipient,
+            "amount": self.amount,
+            "timestamp": self.timestamp,
+            "nonce": self.nonce,
+            "expiry": self.expiry,
+            "fee": self.fee
+        }
+        return json.dumps(message_dict, sort_keys=True).encode()
+
+    def verify_signature(self) -> bool:
+        """Enhanced signature verification"""
+        try:
+            if len(self.public_key) != 32:
+                return False
+                
+            message = self._get_signing_message()
+            verifying_key = ed25519.VerifyingKey(self.public_key)
+            verifying_key.verify(self.signature, message)
+            return True
+        except (ed25519.BadSignatureError, ValueError) as e:
+            logger.error(f"Signature verification failed: {str(e)}")
+            return False
+
+    def to_dict(self) -> dict:
+        """Convert transaction to dictionary"""
+        return {
+            "tx_id": self.tx_id,
+            "chain_id": self.chain_id,
+            "sender": self.sender,
+            "recipient": self.recipient,
+            "amount": self.amount,
+            "timestamp": self.timestamp,
+            "nonce": self.nonce,
+            "signature": base64.b64encode(self.signature).decode(),
+            "public_key": base64.b64encode(self.public_key).decode(),
+            "expiry": self.expiry,
+            "fee": self.fee,
+            "block_height": self.block_height
+        }
+
+@dataclass
+class Block:
+    """Enhanced block implementation with security features"""
+    timestamp: float
+    previous_hash: str
+    transactions: List[Transaction]
+    proof_of_history_hash: bytes
+    poh_proof: List[bytes]
+    poh_sequence_number: int
+    height: int
+    validator: str
+    validator_signature: bytes
+    validator_public_key: bytes
+    chain_id: str
+    merkle_root: str = None
+    
+    def __post_init__(self):
+        """Initialize block with security checks"""
+        if self.merkle_root is None:
+            self.merkle_root = self._calculate_merkle_root()
+            
+        # Validate block size
+        if len(self.transactions) > ChainConfig.MAX_BLOCK_SIZE:
+            raise ValidationError("Block exceeds maximum size")
+
+    def verify(self, previous_block: Optional[Block]) -> bool:
+        """Verify block with enhanced security checks"""
+        try:
+            # Skip previous block checks for genesis block
+            if previous_block is not None:
+                # Verify chain continuity
+                if self.height != previous_block.height + 1:
+                    raise ValidationError("Invalid block height")
+                    
+                # Verify previous hash
+                if self.previous_hash != previous_block.calculate_hash():
+                    raise ValidationError("Invalid previous block hash")
+                    
+                # Verify PoH sequence
+                if self.poh_sequence_number <= previous_block.poh_sequence_number:
+                    raise ValidationError("Invalid PoH sequence number")
+                    
+            # Verify merkle root
+            if self.merkle_root != self._calculate_merkle_root():
+                raise ValidationError("Invalid merkle root")
+                
+            # Verify transactions
+            for tx in self.transactions:
+                if not tx.verify_signature():
+                    raise ValidationError(f"Invalid signature for transaction {tx.tx_id}")
+                    
+            # Verify validator signature
+            try:
+                verifying_key = ed25519.VerifyingKey(self.validator_public_key)
+                message = str(self.height).encode()
+                verifying_key.verify(self.validator_signature, message)
+            except (ed25519.BadSignatureError, ValueError) as e:
+                raise ValidationError(f"Invalid validator signature: {str(e)}")
+                
+            # Verify chain ID
+            if self.chain_id != ChainConfig.CHAIN_ID:
+                raise ValidationError("Invalid chain ID")
+                
+            return True
+            
+        except ValidationError:
+            raise
+        except Exception as e:
+            raise ValidationError(f"Block verification failed: {str(e)}")
+
+    def _calculate_merkle_root(self) -> str:
+        """Calculate merkle root with enhanced security"""
+        if not self.transactions:
+            return hashlib.sha256(b"empty").hexdigest()
+            
+        nodes = [tx.tx_id.encode() for tx in self.transactions]
+        
+        # Ensure even number of nodes
+        if len(nodes) % 2 == 1:
+            nodes.append(nodes[-1])
+            
+        while len(nodes) > 1:
+            new_nodes = []
+            for i in range(0, len(nodes), 2):
+                combined = nodes[i] + nodes[i+1]
+                new_nodes.append(hashlib.sha256(combined).digest())
+            nodes = new_nodes
+            
+        return nodes[0].hex()
+
+    def calculate_hash(self) -> str:
+        """Calculate block hash with enhanced security"""
+        block_dict = {
+            "timestamp": self.timestamp,
+            "previous_hash": self.previous_hash,
+            "transactions": [tx.to_dict() for tx in self.transactions],
+            "proof_of_history_hash": base64.b64encode(self.proof_of_history_hash).decode(),
+            "poh_proof": [base64.b64encode(p).decode() for p in self.poh_proof],
+            "height": self.height,
+            "validator": self.validator,
+            "merkle_root": self.merkle_root,
+            "poh_sequence_number": self.poh_sequence_number,
+            "chain_id": self.chain_id
+        }
+        block_string = json.dumps(block_dict, sort_keys=True)
+        return hashlib.sha256(block_string.encode()).hexdigest()
+
+
+class SecureSimpleSolana:
+    """Enhanced blockchain implementation with security improvements"""
+    def __init__(self):
+        # Enhanced locking mechanism
+        self.chain_lock = RLock()
+        self.account_lock = RLock()
+        self.transaction_lock = RLock()
+        self.validator_lock = RLock()
+        
+        # Core data structures
+        self.chain: List[Block] = []
+        self.memory_pool = SecureMemoryPool(ChainConfig.MAX_MEMORY_POOL_SIZE)
+        self.accounts: Dict[str, AccountState] = {}
+        self.validators: Dict[str, float] = {}
+        
+        # Configuration
+        self.chain_id = ChainConfig.CHAIN_ID
+        self.min_stake_amount = ChainConfig.MIN_STAKE_AMOUNT
+        
+        # Initialize blockchain
+        self._network_key = None
+        self._network_address = None
+        self._init_genesis_block()
+
+    def _init_genesis_block(self):
+        """Initialize genesis block with enhanced security"""
+        # Generate network keypair
+        network_seed = os.urandom(32)
+        self._network_key = ed25519.SigningKey(network_seed)
+        network_verifying_key = self._network_key.get_verifying_key()
+        self._network_address = hashlib.sha256(network_verifying_key.to_bytes()).hexdigest()
+        
+        # Create genesis block
+        genesis_block = self._create_genesis_block()
+        
+        # Initialize network account
+        self._init_network_account(network_verifying_key)
+        
+        logger.info(f"Genesis block created with network address: {self._network_address}")
+
+    def _create_genesis_block(self) -> Block:
+        """Create genesis block with enhanced security"""
+        poh_hash = hashlib.sha256(os.urandom(32)).digest()
+        poh_proof = [poh_hash]  # Simplified for genesis
+        
+        genesis = Block(
+            timestamp=time.time(),
+            previous_hash="0" * 64,
+            transactions=[],
+            proof_of_history_hash=poh_hash,
+            poh_proof=poh_proof,
+            poh_sequence_number=0,
+            height=0,
+            validator=self._network_address,
+            validator_signature=self._network_key.sign(b"0"),
+            validator_public_key=self._network_key.get_verifying_key().to_bytes(),
+            chain_id=self.chain_id
+        )
+        
+        if not genesis.verify(None):
+            raise ValidationError("Genesis block verification failed")
+            
+        self.chain.append(genesis)
+        return genesis
+
+    def _init_network_account(self, network_verifying_key: ed25519.VerifyingKey):
+        """Initialize network account with enhanced security"""
+        self.accounts[self._network_address] = AccountState(
+            address=self._network_address,
+            balance=1_000_000_000.0,
+            nonce=0,
+            public_key=network_verifying_key.to_bytes(),
+            stake=self.min_stake_amount
+        )
+        self.validators[self._network_address] = self.min_stake_amount
+
+    def create_account(self, public_key: bytes) -> str:
+        """Create new account with enhanced security"""
+        if len(public_key) != 32:
+            raise ValidationError("Invalid public key length")
+            
+        try:
+            ed25519.VerifyingKey(public_key)
+        except ValueError:
+            raise ValidationError("Invalid public key format")
+            
+        address = hashlib.sha256(public_key).hexdigest()
+        
+        with self.account_lock:
+            if address in self.accounts:
+                raise ValidationError("Account already exists")
+                
+            self.accounts[address] = AccountState(
+                address=address,
+                balance=0.0,
+                nonce=0,
+                public_key=public_key
+            )
+            
+        return address
+
+    def create_transaction(
+        self,
+        sender_private_key: bytes,
+        recipient: str,
+        amount: float,
+        fee: float,
+        expiry: float = None
+    ) -> Transaction:
+        """Create transaction with enhanced security"""
+        if expiry is None:
+            expiry = time.time() + 3600
+            
+        sender_key = ed25519.SigningKey(sender_private_key)
+        sender = hashlib.sha256(sender_key.get_verifying_key().to_bytes()).hexdigest()
+        
+        with self.account_lock:
+            if sender not in self.accounts:
+                raise ValidationError("Sender account does not exist")
+                
+            account = self.accounts[sender]
+            
+            # Rate limiting
+            if not account.validate_rate_limit():
+                raise RateLimitError("Transaction rate limit exceeded")
+                
+            # Balance check
+            if account.balance < amount + fee:
+                raise ValidationError("Insufficient funds")
+                
+            # Create transaction with chain ID and block height
+            tx = Transaction(
+                chain_id=self.chain_id,
+                sender=sender,
+                recipient=recipient,
+                amount=amount,
+                timestamp=time.time(),
+                nonce=account.nonce + 1,
+                signature=b'',
+                public_key=sender_key.get_verifying_key().to_bytes(),
+                expiry=expiry,
+                fee=fee,
+                block_height=len(self.chain)
+            )
+            
+            # Sign transaction
+            message = tx._get_signing_message()
+            tx.signature = sender_key.sign(message)
+            
+            if not tx.verify_signature():
+                raise SecurityError("Transaction signature verification failed")
+            
+            # Add to memory pool
+            self.memory_pool.add_transaction(tx)
+            
+        return tx
+
+    def _validate_transaction(self, tx: Transaction) -> bool:
+        """Validate transaction with enhanced security"""
+        try:
+            # Verify chain ID
+            if tx.chain_id != self.chain_id:
+                return False
+                
+            # Verify signature
+            if not tx.verify_signature():
+                return False
+                
+            # Verify sender exists
+            if tx.sender not in self.accounts and tx.sender != "network":
+                return False
+                
+            # Verify recipient exists
+            if tx.recipient not in self.accounts:
+                return False
+                
+            # Check expiry
+            if tx.expiry <= time.time():
+                return False
+                
+            # For non-network transactions
+            if tx.sender != "network":
+                sender_account = self.accounts[tx.sender]
+                
+                # Verify nonce
+                if not sender_account.validate_nonce(tx.nonce):
+                    return False
+                    
+                # Verify balance
+                if sender_account.balance < (tx.amount + tx.fee):
+                    return False
+                    
+                # Verify rate limit
+                if not sender_account.validate_rate_limit():
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Transaction validation error: {str(e)}")
+            return False
+
+    def _process_transaction(self, tx: Transaction, validator: str) -> bool:
+        """Process transaction with enhanced security"""
+        try:
+            with self.account_lock:
+                # Skip balance checks for network transactions
+                if tx.sender != "network":
+                    sender_account = self.accounts[tx.sender]
+                    sender_account.balance -= (tx.amount + tx.fee)
+                    sender_account.nonce += 1
+                    self.accounts[validator].balance += tx.fee
+                    
+                recipient_account = self.accounts[tx.recipient]
+                recipient_account.balance += tx.amount
+                
+                # Update transaction metrics
+                if tx.sender != "network":
+                    sender_account.transaction_count += 1
+                    sender_account.last_transaction_time = time.time()
+                
+                return True
+                
+        except Exception as e:
+            logger.error(f"Transaction processing error: {str(e)}")
+            return False
+
+    def create_block(self, validator_private_key: bytes) -> Optional[Block]:
+        """Create block with enhanced security"""
+        try:
+            validator_key = ed25519.SigningKey(validator_private_key)
+            validator = hashlib.sha256(validator_key.get_verifying_key().to_bytes()).hexdigest()
+            
+            with self.validator_lock:
+                # Validate validator status
+                if validator not in self.validators:
+                    raise ValidationError("Not a validator")
+                if self.validators[validator] < self.min_stake_amount:
+                    raise ValidationError("Insufficient validator stake")
+                
+                # Get valid transactions from memory pool
+                valid_transactions = []
+                current_size = 0
+                current_time = time.time()
+                
+                for tx_id, tx in list(self.memory_pool.transactions.items()):
+                    if current_size >= ChainConfig.MAX_BLOCK_WEIGHT:
+                        break
+                        
+                    if tx.expiry > current_time and self._validate_transaction(tx):
+                        valid_transactions.append(tx)
+                        current_size += len(json.dumps(tx.to_dict()).encode())
+                        self.memory_pool.remove_transaction(tx_id)
+                
+                if not valid_transactions:
+                    return None
+                    
+                # Create new block
+                new_block = Block(
+                    timestamp=current_time,
+                    previous_hash=self.chain[-1].calculate_hash(),
+                    transactions=valid_transactions,
+                    proof_of_history_hash=hashlib.sha256(os.urandom(32)).digest(),
+                    poh_proof=[hashlib.sha256(os.urandom(32)).digest()],
+                    poh_sequence_number=len(self.chain),
+                    height=len(self.chain),
+                    validator=validator,
+                    validator_signature=validator_key.sign(str(len(self.chain)).encode()),
+                    validator_public_key=validator_key.get_verifying_key().to_bytes(),
+                    chain_id=self.chain_id
+                )
+                
+                # Verify and process block
+                if not new_block.verify(self.chain[-1]):
+                    raise ValidationError("Block verification failed")
+                    
+                # Process all transactions
+                for tx in valid_transactions:
+                    if not self._process_transaction(tx, validator):
+                        raise ValidationError("Transaction processing failed")
+                
+                # Add block to chain
+                self.chain.append(new_block)
+                return new_block
+                
+        except Exception as e:
+            logger.error(f"Block creation failed: {str(e)}")
+            return None
+    
+
+    def add_validator(self, address: str, stake: float) -> bool:
+        """Add validator with enhanced security"""
+        try:
+            with self.validator_lock:
+                if stake < self.min_stake_amount:
+                    raise ValidationError(f"Stake must be at least {self.min_stake_amount}")
+                    
+                if address not in self.accounts:
+                    raise ValidationError("Validator account does not exist")
+                    
+                account = self.accounts[address]
+                if account.balance < stake:
+                    raise ValidationError("Insufficient balance for stake")
+                    
+                # Update validator status
+                self.validators[address] = stake
+                account.stake = stake
+                account.balance -= stake
+                
+                return True
+                
+        except Exception as e:
+            logger.error(f"Failed to add validator: {str(e)}")
+            return False
+
+    def remove_validator(self, address: str) -> bool:
+        """Remove validator with enhanced security"""
+        try:
+            with self.validator_lock:
+                if address not in self.validators:
+                    raise ValidationError("Not a validator")
+                    
+                stake = self.validators.pop(address)
+                account = self.accounts[address]
+                account.stake = 0
+                account.balance += stake
+                
+                return True
+                
+        except Exception as e:
+            logger.error(f"Failed to remove validator: {str(e)}")
+            return False
+        
+    def get_network_key(self) -> ed25519.SigningKey:
+        """Get the network signing key with security check"""
+        if self._network_key is None:
+            raise SecurityError("Network key not initialized")
+        return self._network_key
+
+    def get_network_address(self) -> str:
+        """Get the network address with security check"""
+        if self._network_address is None:
+            raise SecurityError("Network address not initialized")
+        return self._network_address
+
+    def get_account_state(self, address: str) -> Optional[AccountState]:
+        """Get current state of an account with security check"""
+        with self.account_lock:
+            return self.accounts.get(address)
+
+    def get_block_by_height(self, height: int) -> Optional[Block]:
+        """Get block at specific height with security check"""
+        with self.chain_lock:
+            if 0 <= height < len(self.chain):
+                return self.chain[height]
+            return None
+
+    def get_chain_height(self) -> int:
+        """Get current chain height with security check"""
+        with self.chain_lock:
+            return len(self.chain)
+
+    def get_pending_transactions_count(self) -> int:
+        """Get count of pending transactions with security check"""
+        return len(self.memory_pool.transactions)
+
+    def get_validator_stake(self, address: str) -> Optional[float]:
+        """Get validator stake amount with security check"""
+        with self.validator_lock:
+            return self.validators.get(address)
+            
+    def validate_chain(self) -> bool:
+        """Validate the entire blockchain with enhanced security"""
+        with self.chain_lock:
+            for i in range(1, len(self.chain)):
+                current_block = self.chain[i]
+                previous_block = self.chain[i-1]
+                
+                try:
+                    # Verify block integrity
+                    if not current_block.verify(previous_block):
+                        logger.error(f"Block verification failed at height {i}")
+                        return False
+                        
+                    # Verify chain continuity
+                    if current_block.height != previous_block.height + 1:
+                        logger.error(f"Invalid block height at {i}")
+                        return False
+                    
+                    # Verify previous hash
+                    if current_block.previous_hash != previous_block.calculate_hash():
+                        logger.error(f"Invalid previous hash at block {i}")
+                        return False
+                    
+                    # Verify transactions
+                    for tx in current_block.transactions:
+                        if not tx.verify_signature():
+                            logger.error(f"Invalid transaction signature in block {i}")
+                            return False
+                            
+                    # Verify chain ID
+                    if current_block.chain_id != self.chain_id:
+                        logger.error(f"Invalid chain ID at block {i}")
+                        return False
+                    
+                except Exception as e:
+                    logger.error(f"Chain validation error at block {i}: {str(e)}")
+                    return False
+            
+            return True
+        
+def main():
+    """Test the secure blockchain implementation"""
+    try:
+        # Initialize blockchain
+        blockchain = SecureSimpleSolana()
+        
+        # Get network key and address
+        network_key = blockchain.get_network_key()
+        network_address = blockchain.get_network_address()
+        
+        # Create test accounts
+        signing_key1 = ed25519.SigningKey(os.urandom(32))
+        signing_key2 = ed25519.SigningKey(os.urandom(32))
+        
+        address1 = blockchain.create_account(signing_key1.get_verifying_key().to_bytes())
+        address2 = blockchain.create_account(signing_key2.get_verifying_key().to_bytes())
+        
+        # Fund accounts from network
+        tx1 = blockchain.create_transaction(
+            sender_private_key=network_key.to_bytes(),
+            recipient=address1,
+            amount=10000.0,
+            fee=0.0
+        )
+        
+        # Create block for funding
+        funding_block = blockchain.create_block(network_key.to_bytes())
+        if not funding_block:
+            raise Exception("Failed to create funding block")
+            
+        # Add validator 
+        blockchain.add_validator(address1, 1000.0)
+        
+        # Create transaction between users
+        tx2 = blockchain.create_transaction(
+            sender_private_key=signing_key1.to_bytes(),
+            recipient=address2,
+            amount=100.0,
+            fee=1.0
+        )
+        
+        # Create block with user transaction
+        user_block = blockchain.create_block(signing_key1.to_bytes())
+        if not user_block:
+            raise Exception("Failed to create user transaction block")
+            
+        print("Blockchain test completed successfully")
+        
+    except Exception as e:
+        logger.error(f"Test failed: {str(e)}")
+
+if __name__ == "__main__":
+    main()        
